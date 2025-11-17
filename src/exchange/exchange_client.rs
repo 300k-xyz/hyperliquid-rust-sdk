@@ -177,7 +177,7 @@ impl ExchangeClient {
 
         let output = self
             .http_client
-            .post("/exchange/sign", res)
+            .post("/exchange/signature", res)
             .await
             .map_err(|e| Error::JsonParse(e.to_string()))?;
         debug!("exchange sign Response: {output}");
