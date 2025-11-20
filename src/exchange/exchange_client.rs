@@ -106,10 +106,34 @@ impl ExchangeClient {
         meta: Option<Meta>,
         vault_address: Option<Address>,
     ) -> Result<ExchangeClient> {
+        Self::new_internal(client, wallet, base_url, meta, vault_address, None, None).await
+    }
+
+    pub async fn new_with_ltp_credentials(
+        client: Option<Client>,
+        wallet: PrivateKeySigner,
+        base_url: Option<BaseUrl>,
+        meta: Option<Meta>,
+        vault_address: Option<Address>,
+        ltp_api_key: Option<String>,
+        ltp_api_secret: Option<String>,
+    ) -> Result<ExchangeClient> {
+        Self::new_internal(client, wallet, base_url, meta, vault_address, ltp_api_key, ltp_api_secret).await
+    }
+
+    async fn new_internal(
+        client: Option<Client>,
+        wallet: PrivateKeySigner,
+        base_url: Option<BaseUrl>,
+        meta: Option<Meta>,
+        vault_address: Option<Address>,
+        ltp_api_key: Option<String>,
+        ltp_api_secret: Option<String>,
+    ) -> Result<ExchangeClient> {
         let client = client.unwrap_or_default();
         let base_url = base_url.unwrap_or(BaseUrl::Mainnet);
 
-        let info = InfoClient::new(None, Some(base_url)).await?;
+        let info = InfoClient::new_with_ltp_credentials(None, Some(base_url), ltp_api_key.clone(), ltp_api_secret.clone()).await?;
         let meta = if let Some(meta) = meta {
             meta
         } else {
@@ -130,12 +154,34 @@ impl ExchangeClient {
             wallet,
             meta,
             vault_address,
-            http_client: HttpClient {
-                client,
-                base_url: base_url.get_url(),
-            },
+            http_client: HttpClient::new(client, base_url, base_url.get_url(), ltp_api_key, ltp_api_secret),
             coin_to_asset,
         })
+    }
+
+    async fn post_sign_only_ltp(
+        &self,
+        action: serde_json::Value,
+        signature: Signature,
+        nonce: u64,
+    ) -> Result<String> {
+        let exchange_payload = ExchangePayload {
+            action,
+            signature,
+            nonce,
+            vault_address: self.vault_address,
+        };
+        let res = serde_json::to_string(&exchange_payload)
+            .map_err(|e| Error::JsonParse(e.to_string()))?;
+        debug!("Sending exchange sign request {res:?}");
+
+        let output = self
+            .http_client
+            .post("/exchange/signature", res)
+            .await
+            .map_err(|e| Error::JsonParse(e.to_string()))?;
+        debug!("exchange sign Response: {output}");
+        Ok(output)
     }
 
     async fn post(
@@ -158,15 +204,17 @@ impl ExchangeClient {
         };
         let res = serde_json::to_string(&exchange_payload)
             .map_err(|e| Error::JsonParse(e.to_string()))?;
-        debug!("Sending request {res:?}");
+        debug!("Sending exchange request {res:?}");
 
         let output = &self
             .http_client
             .post("/exchange", res)
             .await
             .map_err(|e| Error::JsonParse(e.to_string()))?;
-        debug!("Response: {output}");
-        serde_json::from_str(output).map_err(|e| Error::JsonParse(e.to_string()))
+        debug!("exchange Response: {output}");
+        serde_json::from_str(output).map_err(|e| {
+            Error::JsonParse(format!("Failed to parse JSON: {}. Raw response: {}", e, output))
+        })
     }
 
     pub async fn enable_big_blocks(
@@ -322,11 +370,7 @@ impl ExchangeClient {
         let slippage = params.slippage.unwrap_or(0.05); // Default 5% slippage
         let wallet = params.wallet.unwrap_or(&self.wallet);
 
-        let base_url = match self.http_client.base_url.as_str() {
-            "https://api.hyperliquid.xyz" => BaseUrl::Mainnet,
-            "https://api.hyperliquid-testnet.xyz" => BaseUrl::Testnet,
-            _ => return Err(Error::GenericRequest("Invalid base URL".to_string())),
-        };
+        let base_url = self.http_client.base_url_enum;
         let info_client = InfoClient::new(None, Some(base_url)).await?;
         let user_state = info_client.user_state(wallet.address()).await?;
 
@@ -426,6 +470,14 @@ impl ExchangeClient {
         self.bulk_order(vec![order], wallet).await
     }
 
+    pub async fn sign_order(
+        &self,
+        order: ClientOrderRequest,
+        wallet: Option<&PrivateKeySigner>,
+    ) -> Result<String> {
+        self.sign_bulk_order(vec![order], wallet).await
+    }
+
     pub async fn order_with_builder(
         &self,
         order: ClientOrderRequest,
@@ -461,6 +513,33 @@ impl ExchangeClient {
         let is_mainnet = self.http_client.is_mainnet();
         let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
         self.post(action, signature, timestamp).await
+    }
+
+    pub async fn sign_bulk_order(
+        &self,
+        orders: Vec<ClientOrderRequest>,
+        wallet: Option<&PrivateKeySigner>,
+    ) -> Result<String> {
+        let wallet = wallet.unwrap_or(&self.wallet);
+        let timestamp = next_nonce();
+
+        let mut transformed_orders = Vec::new();
+
+        for order in orders {
+            transformed_orders.push(order.convert(&self.coin_to_asset)?);
+        }
+
+        let action = Actions::Order(BulkOrder {
+            orders: transformed_orders,
+            grouping: "na".to_string(),
+            builder: None,
+        });
+        let connection_id = action.hash(timestamp, self.vault_address)?;
+        let action = serde_json::to_value(&action).map_err(|e| Error::JsonParse(e.to_string()))?;
+
+        let is_mainnet = self.http_client.is_mainnet();
+        let signature = sign_l1_action(wallet, connection_id, is_mainnet)?;
+        self.post_sign_only_ltp(action, signature, timestamp).await
     }
 
     pub async fn bulk_order_with_builder(

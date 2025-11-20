@@ -70,11 +70,12 @@ pub fn bps_diff(x: f64, y: f64) -> u16 {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Debug, PartialEq)]
 pub enum BaseUrl {
     Localhost,
     Testnet,
     Mainnet,
+    LTP,
 }
 
 impl BaseUrl {
@@ -83,12 +84,15 @@ impl BaseUrl {
             BaseUrl::Localhost => LOCAL_API_URL.to_string(),
             BaseUrl::Mainnet => MAINNET_API_URL.to_string(),
             BaseUrl::Testnet => TESTNET_API_URL.to_string(),
+            BaseUrl::LTP => LTP_HYPERLIQUID_API_URL.to_string(),
         }
     }
 }
 
 lazy_static! {
     static ref CUR_NONCE: AtomicU64 = AtomicU64::new(now_timestamp_ms());
+    static ref LTP_HYPERLIQUID_API_URL: String = std::env::var("LTP_HYPERLIQUID_API_URL")
+        .unwrap_or_else(|_| MAINNET_API_URL.to_string());
 }
 
 #[cfg(test)]
